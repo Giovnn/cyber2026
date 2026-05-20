@@ -1,4 +1,4 @@
-# My Open Publishing Space
+# Progetto Giovanni Bernobic
 
 ## Create, Share and Collaborate
 
