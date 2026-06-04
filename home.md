@@ -186,3 +186,10 @@ La stessa visualizzazione che BloodHound offre all'attaccante è oggi un alleato
 - Slide del corso: *620 — Authentication: NTLM/Kerberos*, *600 — Access Control: Organizations*, *650 — Techniques: Advanced*
 - Kerberoasting Attack Simulation in Active Directory, [https://medium.com/@aradityaraj.07/kerberoasting-attack-simulation-in-active-directory-9b39fad6dacb](https://medium.com/@aradityaraj.07/kerberoasting-attack-simulation-in-active-directory-9b39fad6dacb)
 - Guide To Active Directory Kerberosting With Kali Linux, [https://logos-red.com/blog/guide-to-active-directory-kerberosting-with-kali-linux/](https://logos-red.com/blog/guide-to-active-directory-kerberosting-with-kali-linux/)
+
+<br><br><br><br><br>
+
+### Nota all'uso di strumenti di intelligenza artificiale:
+ Per la preparazione di questo progetto è stato fatto uso di **Gemini** (Google DeepMind) come strumento di supporto alla raccolta di informazioni. In particolare, l'LLM è stato impiegato per orientarsi nella documentazione pubblica disponibile, siti web, articoli tecnici e video, relativa alla configurazione di un ambiente Active Directory in VirtualBox e alla comprensione del flusso di autenticazione Kerberos.
+
+
