@@ -1,6 +1,5 @@
-# Progetto Giovanni Bernobic
-
-## Create, Share and Collaborate
+# Report Cybersecurity: Kerberoasting
+## Giovanni Bernobic - Cybersecurity - A.a. 2025/2026
 
 ![Photo of Mountain](images/mountain.jpg)
 
