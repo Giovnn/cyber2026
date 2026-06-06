@@ -195,7 +195,7 @@ hashcat -m 13100 hashes.txt --show
 ```
 
 #### Nota:
-> Durante l'installazione di Hashcat vengono automaticamente scaricati anche numerosi dizionari con le password usate più frequentemente. Nel mio caso il dizionario `lista-pwd.txt` è stata costruita ad hoc per questo laboratorio e contiene 278 password.
+> Durante l'installazione di Hashcat vengono automaticamente scaricati anche numerosi dizionari con le password usate più frequentemente. Nel mio caso il dizionario `lista-pwd.txt` è stato costruito ad hoc per questo laboratorio e contiene 278 password.
 
 ![Hashcat exhausted](/images/hashcat%20exhausted.png)
 
