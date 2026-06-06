@@ -27,8 +27,6 @@ Il laboratorio è realizzato su **Oracle VirtualBox** con due macchine virtuali 
 
 ### 3.1 Setup Windows Server 2022
 
-![Schermata di Windows Server Manager ](/images/windows%20server%20manager%20home.png)
-
 #### Nota teorica:
 >
 > I Service Principal Names (SPN) sono identificatori unici in Active Directory utilizzati per mappare le istanze di servizio agli account di servizio per l'autenticazione Kerberos. Un SPN è composto da più componenti che, combinati, forniscono un'identità completa per un servizio specifico (Classe, Hostname, Account, Porta)
@@ -75,8 +73,6 @@ Sul DC con il modulo Active Directory per Windows PowerShell sono stati creati:
 
 <br>
 
-![Creazione utenti e gruppi](/images/creazione%20utenti,%20gruppi%20e%20servizi.png)
-
 
 ## 4. Verifica del foothold e sincronizzazione temporale
 
@@ -113,8 +109,6 @@ Sucessivamente questi dati vengono importati nell'interfaccia di BloodHound per 
 bloodhound-python -u giovanni -p 'Password1!' -d units.local \
   -ns 192.168.56.10 -c All --zip
 ```
-
-![Query LDAP e file ZIP](/images/query%20LDAP%20e%20file%20zip.png)
 
 Il flag `-c All` raccoglie tutti i metodi disponibili (GroupMembers, LocalAdmin, RDP, DCOM, LoggedOn, ObjectProps, ACL). Il flag `--zip` comprime i JSON in un unico archivio.
 
@@ -177,6 +171,7 @@ Il file `hashes.txt` contiene gli hash nel formato Hashcat. Il prefisso identifi
 
 
 `$krb5tgs$23$`: RC4-HMAC, hashcat mode 13100
+
 `$krb5tgs$18$`: AES256, hashcat mode 19700
 
 
@@ -200,7 +195,7 @@ hashcat -m 13100 hashes.txt --show
 ```
 
 #### Nota:
-> Durante l'installazione di Hashcat vengono automaticamente scaricati anche numerosi dizionari con le password usate più frequentemente. Nel mio caso la `lista-pwd.txt` è stata costruita ad hoc per questo laboratorio e contiene 278 password.
+> Durante l'installazione di Hashcat vengono automaticamente scaricati anche numerosi dizionari con le password usate più frequentemente. Nel mio caso il dizionario `lista-pwd.txt` è stata costruita ad hoc per questo laboratorio e contiene 278 password.
 
 ![Hashcat exhausted](/images/hashcat%20exhausted.png)
 
@@ -209,7 +204,7 @@ Nonostante la scelta di una regola aggressiva come `best66.rule` lo status del c
 - Cambiare regola di mutazione
 - Cambiare entrambi
 
-In questo caso è stata usata una diversa regola di mutazione `dive.rule`, una delle più aggressive presenti su Hashcat
+In questo caso è stata usata una diversa regola di mutazione: `dive.rule`, una delle più aggressive presenti su Hashcat.
 
 ``` bash
 hashcat -m 13100 -a 0 hashes.txt ./lista-pwd.txt -r /usr/share/hashcat/rules/dive.rule --force
@@ -230,9 +225,13 @@ Con le credenziali di `svc_sql` in chiaro, l'attaccante può aprire una shell re
 impacket-smbexec units.local/svc_sql:'P4ssw0rd2!'@192.168.56.10
 ```
 
-`smbexec` si connette al DC via SMB, crea un servizio Windows temporaneo che lancia `cmd.exe`, invia i comandi attraverso named pipe e rimuove il servizio dopo ogni risposta; tutto senza scrivere file persistenti sul disco. La shell risultante opera nel contesto di `svc_sql`, membro di Domain Admins.
+ Lo strumento `smbexec` si collega al computer bersaglio tramite il protocollo di rete SMB e crea un servizio di sistema temporaneo che lancia direttamente il prompt dei comandi nativo di Windows `cmd.exe`.
+ Esso invia i comandi attraverso named pipe e rimuove il servizio dopo ogni risposta; tutto senza scrivere file persistenti sul disco. 
+ Attraverso il comando `ipconfig` possiamo effetivamente vedere che l'indirizzo IP è proprio quello del DC, e con `whoami /groups` si può vedere come l'account di servizio `svc_sql` faccia parte del gruppo `Administrators`. 
 
-Dalla shell, l'accesso privilegiato viene dimostrato eseguendo:
+
+![Impacket shell dentro DC](/images/Impacket%20shell%20dentro%20DC.png)
+
 
 ```bash
 shutdown /s /t 0
@@ -244,16 +243,19 @@ Il Domain Controller si spegne: il dominio è compromesso.
 
 ## 8. Conclusioni e mitigazioni
 
-L'attacco non ha richiesto exploit di codice né vulnerabilità zero-day. La compromissione è la composizione di tre elementi: (1) il protocollo Kerberos, by design, concede TGS a qualunque utente autenticato; (2) un account utente con SPN registrato — condizione sufficiente per il Kerberoasting; (3) una password debole, craccabile offline. BloodHound ha reso visibile, in un unico grafo, ciò che in un'analisi manuale richiederebbe decine di query LDAP separate.
+L'attacco non ha richiesto exploit di codice né vulnerabilità zero-day. La compromissione è la composizione di tre elementi: (1) il protocollo Kerberos, concede TGS a qualunque utente autenticato; (2) un account utente con SPN registrato, condizione sufficiente per il Kerberoasting; (3) una password debole, craccabile offline. BloodHound ha reso visibile, in un unico grafo, ciò che in un'analisi manuale richiederebbe decine di query LDAP separate.
 
-**Mitigazioni in un ambiente di produzione:**
+**Mitigazioni da tenere in considerazione:**
 
-- **Group Managed Service Accounts (gMSA):** gli SPN dovrebbero risiedere su gMSA, non su account utente. I gMSA hanno password di 240 caratteri casuali, ruotate automaticamente da AD e mai note agli operatori.
-- **AES-only:** deprecare RC4-HMAC e forzare la cifratura AES aumenta esponenzialmente il costo computazionale del cracking offline.
-- **Principio del minimo privilegio:** un account di servizio SQL non deve essere Domain Admin. Il tiering amministrativo (workstation / server / DC) limita il blast radius delle compromissioni laterali.
-- **Monitoring dell'evento 4769:** ogni richiesta di TGS genera l'evento Windows Security 4769. Un utente che richiede TGS per molti SPN in rapida successione è un segnale Kerberoasting rilevabile con anomaly detection.
+- **Group Managed Service Accounts (gMSA):** gli account utente standard con SPN associati sono un facile bersaglio di Kerberoasting; con i gMSA questo diventa totalmente inefficace a causa della complessità della password (240 caratteri) e dall'algoritmo di cifratura (AES-256).
+- **AES-only:** deprecare RC4-HMAC e forzare la cifratura AES aumenterebbe  esponenzialmente il costo computazionale del cracking offline.
+- **Principio del minimo privilegio:** un account di servizio SQL non deve essere Domain Admin ma avere solamente i privilegi necessari a funzionare correttamente.
+- **Monitoring degli eventi LDAP**: come è stato fatto notare, l'uso di strumenti di testing come Impacket genera traffico facilmente intercettabile.
+- **Monitoring dell'evento 4769:** ogni richiesta di TGS genera l'evento Windows Security 4769. Un utente che richiede TGS per molti SPN in rapida successione è un segnale Kerberoasting rilevabile facilmente. In questa demo ne vengono richiesti solamente due ma in un contesto aziendale i servizi potrebbero essere decine.
+- **Monitoring dell'evento 7045:** dopo aver aperto la shell fittizia, ogni comando mandato alla macchina può essere intercettato attraverso l'evento 7045 di Windows, che rileva quando un nuovo servizio viene installato.
 
-La stessa visualizzazione che BloodHound offre all'attaccante è oggi un alleato dei Blue Team: usarla periodicamente per identificare e correggere i percorsi prima che vengano sfruttati è la difesa più efficace.
+![Evento 7045 ipconfig](/images/evento%207045%20ipconfig.png)
+![Evento 7045 whoami](/images/evento%207045%20whoami.png)
 
 
 
